@@ -17,6 +17,10 @@ class PowerToolViewController: NSViewController, NSWindowDelegate {
     
     @IBOutlet weak var basicLabel: NSTextField!
     @IBOutlet weak var overviewSpeedShift: CPUSpeedShiftView!
+
+    private static let rememberPStateDefaultsKey = "AMDPowerGadgetRememberPStateEnabled"
+    private static let preferredPStateDefaultsKey = "AMDPowerGadgetPreferredPStateIndex"
+    private var pstateMemoryCheckbox: NSButton?
     
     @IBOutlet weak var configTabView: NSTabView!
     @IBOutlet weak var configControl: NSSegmentedControl!
@@ -88,17 +92,28 @@ class PowerToolViewController: NSViewController, NSWindowDelegate {
     var sumCount = 0
     
     static var activeSelf : PowerToolViewController?
+    // PATCH: PowerTool window activation fix
     static func launch(forceFocus: Bool = false){
         if let vc = PowerToolViewController.activeSelf {
-            vc.view.window?.orderFrontRegardless()
+            if let window = vc.view.window {
+                if forceFocus {
+                    NSApp.activate(ignoringOtherApps: true)
+                    window.makeKeyAndOrderFront(nil)
+                } else {
+                    window.orderFrontRegardless()
+                }
+            }
         } else {
             let mainStoryboard = NSStoryboard.init(name: NSStoryboard.Name("Main"), bundle: nil)
             let controller = mainStoryboard.instantiateController(withIdentifier: NSStoryboard.SceneIdentifier("AMDPowerTool")) as! NSWindowController
             controller.showWindow(self)
 
             controller.window?.isMovableByWindowBackground = true
-            
-            if forceFocus {controller.window?.orderFrontRegardless()}
+
+            if forceFocus, let window = controller.window {
+                NSApp.activate(ignoringOtherApps: true)
+                window.makeKeyAndOrderFront(nil)
+            }
         }
     }
     
@@ -120,6 +135,7 @@ class PowerToolViewController: NSViewController, NSWindowDelegate {
         })
 
         setupOverview()
+        setupPStateMemoryCheckbox()
 
         updatePStateDef()
         updateCPB()
@@ -184,8 +200,12 @@ class PowerToolViewController: NSViewController, NSWindowDelegate {
         let selectedState = overviewSpeedShift.selectedItem
         guard selectedState >= 0 else { return }
 
-        // Persist only an explicit user choice from the P-State selector.
-        UserDefaults.standard.set(selectedState, forKey: "AMDPowerGadgetPreferredPStateIndex")
+        // Persist only an explicit user choice when the user enables P-State memory.
+        if UserDefaults.standard.bool(forKey: Self.rememberPStateDefaultsKey) {
+            UserDefaults.standard.set(selectedState, forKey: Self.preferredPStateDefaultsKey)
+        } else {
+            UserDefaults.standard.removeObject(forKey: Self.preferredPStateDefaultsKey)
+        }
         ProcessorModel.shared.setPPM(enabled: false)
         ProcessorModel.shared.setPState(state: selectedState)
         updateASA()
@@ -222,6 +242,50 @@ class PowerToolViewController: NSViewController, NSWindowDelegate {
         }
     }
     
+    private func setupPStateMemoryCheckbox() {
+        // The checkbox is added to the Overview tab's existing container, next to “频率档位”.
+        // This avoids changing storyboard IDs or existing outlet connections.
+        guard let overviewContainer = overviewSpeedShift.superview else {
+            NSLog("Unable to add the P-State memory checkbox: Overview container is missing.")
+            return
+        }
+
+        let checkbox = NSButton(
+            checkboxWithTitle: "记忆",
+            target: self,
+            action: #selector(pstateMemoryCheckboxChanged(_:))
+        )
+        checkbox.frame = NSRect(x: 367, y: 240, width: 67, height: 19)
+        checkbox.state = UserDefaults.standard.bool(forKey: Self.rememberPStateDefaultsKey) ? .on : .off
+        checkbox.toolTip = "勾选后，记忆当前的 P-State，并在应用启动或系统唤醒后恢复"
+        overviewContainer.addSubview(checkbox)
+        self.pstateMemoryCheckbox = checkbox
+
+        // Remove any preference left by the older always-on patch when memory is disabled.
+        if checkbox.state != .on {
+            UserDefaults.standard.removeObject(forKey: Self.preferredPStateDefaultsKey)
+        }
+    }
+
+    @objc private func pstateMemoryCheckboxChanged(_ sender: NSButton) {
+        let rememberEnabled = sender.state == .on
+        UserDefaults.standard.set(rememberEnabled, forKey: Self.rememberPStateDefaultsKey)
+
+        guard rememberEnabled else {
+            UserDefaults.standard.removeObject(forKey: Self.preferredPStateDefaultsKey)
+            return
+        }
+
+        // If memory is enabled while a fixed state is already selected, save it immediately.
+        // Adaptive PPM mode has no fixed P-State to remember.
+        let selectedState = overviewSpeedShift.selectedItem
+        if selectedState >= 0 && !ProcessorModel.shared.getPPM() {
+            UserDefaults.standard.set(selectedState, forKey: Self.preferredPStateDefaultsKey)
+        } else {
+            UserDefaults.standard.removeObject(forKey: Self.preferredPStateDefaultsKey)
+        }
+    }
+
     func updatePStateDef() {
         ProcessorModel.shared.refreshPStateDef()
         vaildStatesClock = ProcessorModel.shared.getVaildPStateClocks()

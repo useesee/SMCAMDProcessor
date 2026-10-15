@@ -101,7 +101,10 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             name: NSWorkspace.didWakeNotification,
             object: nil
         )
-        restorePreferredPStateSelection()
+        // Delay restore slightly so launch-time driver initialization does not immediately reset the selection.
+        DispatchQueue.main.asyncAfter(deadline: .now() + 2.0) { [weak self] in
+            self?.restorePreferredPStateSelection()
+        }
 
         let useTran = UserDefaults.standard.bool(forKey: "usetranslucency")
         let sb = UserDefaults.standard.bool(forKey: "statusbarenabled")
@@ -176,6 +179,9 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
 
     private func restorePreferredPStateSelection() {
+        guard UserDefaults.standard.bool(forKey: "AMDPowerGadgetRememberPStateEnabled") else {
+            return // Memory is opt-in; keep the normal driver/default selection when unchecked.
+        }
         guard let preferredState = UserDefaults.standard.object(forKey: "AMDPowerGadgetPreferredPStateIndex") as? Int else {
             return // No fixed state has been explicitly chosen; leave adaptive/default mode untouched.
         }
@@ -195,7 +201,8 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
     @objc private func pstateRestoreSelectionDidWake(_ notification: Notification) {
         // After wake, allow the driver/work loop time to resume before re-applying the saved selector.
-        guard UserDefaults.standard.object(forKey: "AMDPowerGadgetPreferredPStateIndex") != nil else { return }
+        guard UserDefaults.standard.bool(forKey: "AMDPowerGadgetRememberPStateEnabled"),
+              UserDefaults.standard.object(forKey: "AMDPowerGadgetPreferredPStateIndex") != nil else { return }
         DispatchQueue.main.asyncAfter(deadline: .now() + 2.0) { [weak self] in
             self?.restorePreferredPStateSelection()
         }

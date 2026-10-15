@@ -55,7 +55,7 @@
                                     </items>
                                 </menu>
                             </menuItem>
-                            <menuItem title="Open" id="H8h-7b-M4v">
+                            <menuItem title="打开" id="H8h-7b-M4v">
                                 <modifierMask key="keyEquivalentModifierMask"/>
                                 <menu key="submenu" title="打开" id="HyV-fh-RgO">
                                     <items>
@@ -93,7 +93,7 @@
                                     </items>
                                 </menu>
                             </menuItem>
-                            <menuItem title="Appearance" id="YPP-op-718">
+                            <menuItem title="外观" id="YPP-op-718">
                                 <modifierMask key="keyEquivalentModifierMask"/>
                                 <menu key="submenu" title="外观" id="2QC-gb-0f6">
                                     <items>
@@ -119,7 +119,7 @@
                                     </items>
                                 </menu>
                             </menuItem>
-                            <menuItem title="Window" id="aUF-d1-5bR">
+                            <menuItem title="窗口" id="aUF-d1-5bR">
                                 <modifierMask key="keyEquivalentModifierMask"/>
                                 <menu key="submenu" title="窗口" systemMenu="window" id="Td7-aD-5lo">
                                     <items>
@@ -144,7 +144,7 @@
                                     </items>
                                 </menu>
                             </menuItem>
-                            <menuItem title="Help" id="wpr-3q-Mcd">
+                            <menuItem title="帮助" id="wpr-3q-Mcd">
                                 <modifierMask key="keyEquivalentModifierMask"/>
                                 <menu key="submenu" title="帮助" systemMenu="help" id="F2S-fz-NVQ">
                                     <items>
