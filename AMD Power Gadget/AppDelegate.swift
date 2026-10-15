@@ -1,0 +1,204 @@
+//
+//  AppDelegate.swift
+//  AMD Power Gadget
+//
+//  Created by trulyspinach on 2/22/20.
+//
+
+import Cocoa
+import ServiceManagement
+
+@NSApplicationMain
+class AppDelegate: NSObject, NSApplicationDelegate {
+
+    var mbController: StatusbarController?
+    
+    @IBOutlet weak var appearanceToggle: NSMenuItem!
+    @IBOutlet weak var statusbarToggle: NSMenuItem!
+    @IBOutlet weak var startAtLoginToggle: NSMenuItem!
+    
+    
+    @IBAction func openPage(_ sender: Any) {
+        NSWorkspace.shared.open(URL(string: "https://github.com/trulyspinach/SMCAMDProcessor")!)
+    }
+    
+    @IBAction func gadget(_ sender: Any) {
+        ViewController.launch()
+        
+    }
+    
+    @IBAction func tool(_ sender: Any) {
+        PowerToolViewController.launch()
+    }
+    
+    static func launchGadget(){
+        ViewController.launch()
+    }
+    
+    static func haveActiveWindows() -> Bool {
+        if !UserDefaults.standard.bool(forKey: "statusbarenabled") {return true}
+        
+        return ViewController.activeSelf != nil
+            || PowerToolViewController.activeSelf != nil
+            || SystemMonitorViewController.activeSelf != nil
+    }
+    
+    static func updateDockIcon() {
+        NSApplication.shared.setActivationPolicy(haveActiveWindows() ? .regular : .accessory)
+    }
+    
+    @IBAction func changeAppearance(_ sender: Any) {
+        applyAppearanceSwitch(translucency: appearanceToggle.state == .off)
+    }
+    
+    @IBAction func toggleStatusBar(_ sender: Any) {
+        applyStatusBarSwitch(enabled: statusbarToggle.state == .off)
+    }
+    
+    @IBAction func startAtLogin(_ sender: Any) {
+        applyStartAtLogin(enabled: startAtLoginToggle.state == .off)
+    }
+    
+    @IBAction func sysmonitor(_ sender: Any) {
+        SystemMonitorViewController.launch()
+    }
+    
+    func applicationDidFinishLaunching(_ aNotification: Notification) {
+        
+        let keyDefaults = [
+            "usetranslucency" : false,
+            "statusbarenabled": true,
+            "startAtLogin": false,
+            "startAtLoginAsked": false
+        ]
+        
+        UserDefaults.standard.register(defaults: keyDefaults)
+
+        // Restore the table at app launch only when the user has opted in.
+        if UserDefaults.standard.bool(forKey: "pstateAutoLoadEnabled") {
+            if let savedPState = PStateEditorViewController.loadSavedPState() {
+                let result = ProcessorModel.shared.setPState(def: savedPState)
+                if result != 0 {
+                    let alert = NSAlert()
+                    alert.messageText = "自动加载 P-State 失败"
+                    alert.informativeText =
+                        "无法将已保存的 P-State 表写入驱动。请检查当前用户权限，或打开 Power Tool 后手动 Apply。\n文件：\(PStateEditorViewController.autoPStateURL.path)"
+                    alert.alertStyle = .warning
+                    alert.addButton(withTitle: "好")
+                    alert.runModal()
+                }
+            } else {
+                NSLog("P-State auto-load is enabled, but no valid 8-entry file exists at %@",
+                      PStateEditorViewController.autoPStateURL.path)
+            }
+        }
+
+        // Restore a user-selected fixed P-State after the driver has initialized.
+        // The selection is separate from the exported P-State definition table.
+        NSWorkspace.shared.notificationCenter.addObserver(
+            self,
+            selector: #selector(pstateRestoreSelectionDidWake(_:)),
+            name: NSWorkspace.didWakeNotification,
+            object: nil
+        )
+        restorePreferredPStateSelection()
+
+        let useTran = UserDefaults.standard.bool(forKey: "usetranslucency")
+        let sb = UserDefaults.standard.bool(forKey: "statusbarenabled")
+        let sl = UserDefaults.standard.bool(forKey: "startAtLogin")
+        
+        if !UserDefaults.standard.bool(forKey: "startAtLoginAsked") {
+            askStartup()
+            UserDefaults.standard.set(true, forKey: "startAtLoginAsked")
+        } else { applyStartAtLogin(enabled: sl) }
+        
+        applyStatusBarSwitch(enabled: sb)
+        applyAppearanceSwitch(translucency: useTran)
+        
+        
+        if !sb {
+            ViewController.launch()
+        }
+    
+    }
+    
+    func askStartup() {
+        let alert = NSAlert()
+        alert.messageText = "Startup at login?"
+        alert.informativeText = "Do you want AMD Power Gadget to start in menu bar at login? \n\n This will only be asked once. You can change this setting later under Appearance menu."
+        alert.alertStyle = .critical
+        alert.addButton(withTitle: "Yes")
+        alert.addButton(withTitle: "No")
+        let res = alert.runModal()
+        
+        if res == .alertFirstButtonReturn {
+            applyStartAtLogin(enabled: true)
+        }
+        
+        if res == .alertSecondButtonReturn {
+            applyStartAtLogin(enabled: false)
+        }
+    }
+    
+    func applicationWillTerminate(_ aNotification: Notification) {
+        // Insert code here to tear down your application
+        ProcessorModel.shared.closeDriver()
+    }
+    
+    func applyAppearanceSwitch(translucency : Bool) {
+        appearanceToggle.state = translucency ? .on : .off
+        ViewController.activeSelf?.toggleTranslucency(enabled: translucency)
+        PowerToolViewController.activeSelf?.toggleTranslucency(enabled: translucency)
+        
+        UserDefaults.standard.set(translucency, forKey: "usetranslucency")
+    }
+    
+    func applyStatusBarSwitch(enabled: Bool) {
+        statusbarToggle.state = enabled ? .on : .off
+        if enabled {
+            if mbController == nil {
+                mbController = StatusbarController()
+                AppDelegate.updateDockIcon()
+            }
+        } else {
+            mbController?.dismiss()
+            mbController = nil
+        }
+        
+        UserDefaults.standard.set(enabled, forKey: "statusbarenabled")
+    }
+    
+    func applyStartAtLogin(enabled: Bool) {
+        startAtLoginToggle.state = enabled ? .on : .off
+        UserDefaults.standard.set(enabled, forKey: "startAtLogin")
+        SMLoginItemSetEnabled("wtf.spinach.APGLaunchHelper" as CFString, enabled)
+    }
+
+
+    private func restorePreferredPStateSelection() {
+        guard let preferredState = UserDefaults.standard.object(forKey: "AMDPowerGadgetPreferredPStateIndex") as? Int else {
+            return // No fixed state has been explicitly chosen; leave adaptive/default mode untouched.
+        }
+
+        let model = ProcessorModel.shared
+        let validStateCount = model.getVaildPStateClocks().count
+        guard preferredState >= 0, preferredState < validStateCount, preferredState <= 7 else {
+            NSLog("Saved P-State index %d is not valid for the current P-State table (count=%d).", preferredState, validStateCount)
+            return
+        }
+
+        // Selecting a fixed state disables the app's adaptive PPM mode first.
+        model.setPPM(enabled: false)
+        model.setPState(state: preferredState)
+        NSLog("Restored AMD Power Gadget P-State index %d.", preferredState)
+    }
+
+    @objc private func pstateRestoreSelectionDidWake(_ notification: Notification) {
+        // After wake, allow the driver/work loop time to resume before re-applying the saved selector.
+        guard UserDefaults.standard.object(forKey: "AMDPowerGadgetPreferredPStateIndex") != nil else { return }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 2.0) { [weak self] in
+            self?.restorePreferredPStateSelection()
+        }
+    }
+}
+
