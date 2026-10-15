@@ -251,13 +251,13 @@ class PowerToolViewController: NSViewController, NSWindowDelegate {
         }
 
         let checkbox = NSButton(
-            checkboxWithTitle: "记忆",
+            checkboxWithTitle: "",
             target: self,
             action: #selector(pstateMemoryCheckboxChanged(_:))
         )
-        checkbox.frame = NSRect(x: 367, y: 240, width: 67, height: 19)
+        checkbox.frame = NSRect(x: 428, y: 240, width: 28, height: 19)
         checkbox.state = UserDefaults.standard.bool(forKey: Self.rememberPStateDefaultsKey) ? .on : .off
-        checkbox.toolTip = "勾选后，记忆当前的 P-State，并在应用启动或系统唤醒后恢复"
+        checkbox.toolTip = "勾选后记忆当前的PState，并在应用启动或系统唤醒后恢复"
         overviewContainer.addSubview(checkbox)
         self.pstateMemoryCheckbox = checkbox
 
