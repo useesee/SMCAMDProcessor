@@ -8,6 +8,33 @@
 import Cocoa
 import ServiceManagement
 
+// Native hover cursors for interactive AppKit controls.
+// These subclasses are also used by Main.storyboard via customClass.
+final class HoverCursorButton: NSButton {
+    override func resetCursorRects() {
+        super.resetCursorRects()
+        guard isEnabled, !isHidden, alphaValue > 0 else { return }
+        addCursorRect(bounds, cursor: .pointingHand)
+    }
+}
+
+final class HoverCursorSegmentedControl: NSSegmentedControl {
+    override func resetCursorRects() {
+        super.resetCursorRects()
+        guard isEnabled, !isHidden, alphaValue > 0 else { return }
+        addCursorRect(bounds, cursor: .pointingHand)
+    }
+}
+
+final class HoverCursorPopUpButton: NSPopUpButton {
+    override func resetCursorRects() {
+        super.resetCursorRects()
+        guard isEnabled, !isHidden, alphaValue > 0 else { return }
+        addCursorRect(bounds, cursor: .pointingHand)
+    }
+}
+
+
 @NSApplicationMain
 class AppDelegate: NSObject, NSApplicationDelegate {
 
@@ -103,7 +130,10 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         )
         // Delay restore slightly so launch-time driver initialization does not immediately reset the selection.
         DispatchQueue.main.asyncAfter(deadline: .now() + 2.0) { [weak self] in
-            self?.restorePreferredPStateSelection()
+            // Finish the table-restore command first, then restore a remembered P0/P1/P2 selection.
+            self?.runStartupCommandIfEnabled(trigger: "login") { [weak self] in
+                self?.restorePreferredPStateSelection()
+            }
         }
 
         let useTran = UserDefaults.standard.bool(forKey: "usetranslucency")
@@ -200,11 +230,69 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     @objc private func pstateRestoreSelectionDidWake(_ notification: Notification) {
-        // After wake, allow the driver/work loop time to resume before re-applying the saved selector.
-        guard UserDefaults.standard.bool(forKey: "AMDPowerGadgetRememberPStateEnabled"),
-              UserDefaults.standard.object(forKey: "AMDPowerGadgetPreferredPStateIndex") != nil else { return }
+        // Run the selected startup action after the driver/work loop has time to resume.
+        // Do not gate this callback on P-State memory: command mode must work independently.
         DispatchQueue.main.asyncAfter(deadline: .now() + 2.0) { [weak self] in
-            self?.restorePreferredPStateSelection()
+            self?.runStartupCommandIfEnabled(trigger: "wake") { [weak self] in
+                self?.restorePreferredPStateSelection()
+            }
+        }
+    }
+
+    private func runStartupCommandIfEnabled(
+        trigger: String,
+        completion: (() -> Void)? = nil
+    ) {
+        // Never run the custom command when the built-in table loader is selected.
+        guard UserDefaults.standard.bool(
+            forKey: PStateEditorViewController.startupCommandEnabledKey
+        ), !UserDefaults.standard.bool(
+            forKey: PStateEditorViewController.autoLoadEnabledKey
+        ) else {
+            completion?()
+            return
+        }
+
+        let command = (UserDefaults.standard.string(
+            forKey: PStateEditorViewController.startupCommandTextKey
+        ) ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+
+        guard !command.isEmpty else {
+            NSLog("P-State startup command is enabled, but the command field is empty (trigger=%@).", trigger)
+            completion?()
+            return
+        }
+
+        NSLog("Launching P-State startup command (trigger=%@).", trigger)
+
+        DispatchQueue.global(qos: .utility).async {
+            defer {
+                DispatchQueue.main.async {
+                    completion?()
+                }
+            }
+
+            let process = Process()
+            process.executableURL = URL(fileURLWithPath: "/bin/zsh")
+            // A login shell supports shell syntax and the user's PATH. Relative paths depend
+            // on the working directory; absolute paths or an explicit cd command are safer.
+            process.arguments = ["-lc", command]
+
+            do {
+                try process.run()
+                process.waitUntilExit()
+                NSLog(
+                    "P-State startup command finished (trigger=%@, exit status=%d).",
+                    trigger,
+                    process.terminationStatus
+                )
+            } catch {
+                NSLog(
+                    "Unable to launch P-State startup command (trigger=%@): %@",
+                    trigger,
+                    error.localizedDescription
+                )
+            }
         }
     }
 }

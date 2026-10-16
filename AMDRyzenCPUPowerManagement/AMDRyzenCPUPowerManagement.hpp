@@ -217,6 +217,10 @@ public:
     uint8_t PStateCur_perCore[CPUInfo::MaxCpus];
     uint8_t PStateCtl = 0;
     uint64_t PStateDef_perCore[8];
+    // Preserve the live P-state definitions across sleep; firmware may rewrite P1 on resume.
+    uint64_t PStateDef_beforeSleep[8] {};
+    bool PStateDef_beforeSleepValid = false;
+    bool restorePStateAfterWake = false;
     uint8_t PStateEnabledLen = 0;
     float PStateDefClock_perCore[8];
     bool cpbSupported;

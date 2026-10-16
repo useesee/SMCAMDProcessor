@@ -7,7 +7,12 @@
 
 import Cocoa
 
-class PStateEditorViewController: NSViewController, NSTableViewDelegate, NSTableViewDataSource {
+class PStateEditorViewController: NSViewController, NSTableViewDelegate, NSTableViewDataSource, NSTextFieldDelegate {
+
+    static let autoLoadEnabledKey = "pstateAutoLoadEnabled"
+    static let startupCommandEnabledKey = "pstateStartupCommandEnabled"
+    static let startupCommandTextKey = "pstateStartupCommand"
+    static let startupCommandExample = "sudo ./PStateRestore ./fixed.pstate"
 
     // Shared .pstate file for Apply-time export and app-launch restore.
     static let autoPStateURL: URL = {
@@ -45,6 +50,8 @@ class PStateEditorViewController: NSViewController, NSTableViewDelegate, NSTable
 
     private var autoLoadCheckbox: NSButton!
     private var autoPathField: NSTextField!
+    private var startupCommandCheckbox: NSButton!
+    private var startupCommandField: NSTextField!
 
     var data : [[String: UInt32]] = []
     
@@ -67,34 +74,100 @@ class PStateEditorViewController: NSViewController, NSTableViewDelegate, NSTable
 
     private func setupPStateAutoLoadControls() {
         // Add controls at runtime so the original storyboard IDs remain untouched.
+        // Reserve two rows below the P-State table.
         if let scroll = tableView.enclosingScrollView {
             var frame = scroll.frame
-            frame.origin.y += 24
-            frame.size.height = max(100, frame.size.height - 24)
+            frame.origin.y += 48
+            frame.size.height = max(80, frame.size.height - 48)
             scroll.frame = frame
         }
 
-        autoLoadCheckbox = NSButton(
-            checkboxWithTitle: "启动加载PState：",
+        let autoLoadEnabled = UserDefaults.standard.bool(forKey: Self.autoLoadEnabledKey)
+        let requestedCommandEnabled = UserDefaults.standard.bool(forKey: Self.startupCommandEnabledKey)
+        let commandEnabled = requestedCommandEnabled && !autoLoadEnabled
+
+        // Repair conflicting saved preferences; preserve the existing built-in loader.
+        if requestedCommandEnabled && autoLoadEnabled {
+            UserDefaults.standard.set(false, forKey: Self.startupCommandEnabledKey)
+        }
+
+        autoLoadCheckbox = HoverCursorButton(
+            checkboxWithTitle: "启动加载PState",
             target: self,
             action: #selector(autoLoadCheckboxChanged(_:))
         )
-        autoLoadCheckbox.frame = NSRect(x: 20, y: 50, width: 188, height: 18)
-        autoLoadCheckbox.state = UserDefaults.standard.bool(forKey: "pstateAutoLoadEnabled") ? .on : .off
+        autoLoadCheckbox.frame = NSRect(x: 20, y: 80, width: 128, height: 18)
+        autoLoadCheckbox.state = autoLoadEnabled ? .on : .off
         autoLoadCheckbox.autoresizingMask = [.maxXMargin, .minYMargin]
         view.addSubview(autoLoadCheckbox)
 
         autoPathField = NSTextField(labelWithString: Self.autoPStateURL.path)
-        autoPathField.frame = NSRect(x: 160, y: 45, width: max(280, view.bounds.width - 160), height: 20)
+        autoPathField.frame = NSRect(x: 150, y: 75, width: max(220, view.bounds.width - 175), height: 20)
         autoPathField.font = NSFont.systemFont(ofSize: 10)
         autoPathField.lineBreakMode = .byTruncatingMiddle
         autoPathField.toolTip = Self.autoPStateURL.path
         autoPathField.autoresizingMask = [.width, .minYMargin]
         view.addSubview(autoPathField)
+
+        startupCommandCheckbox = HoverCursorButton(
+            checkboxWithTitle: "启动执行命令",
+            target: self,
+            action: #selector(startupCommandCheckboxChanged(_:))
+        )
+        startupCommandCheckbox.frame = NSRect(x: 20, y: 50, width: 128, height: 18)
+        startupCommandCheckbox.state = commandEnabled ? .on : .off
+        startupCommandCheckbox.autoresizingMask = [.maxXMargin, .minYMargin]
+        view.addSubview(startupCommandCheckbox)
+
+        startupCommandField = NSTextField(
+            string: UserDefaults.standard.string(forKey: Self.startupCommandTextKey) ?? ""
+        )
+        startupCommandField.frame = NSRect(x: 150, y: 50, width: max(220, view.bounds.width - 175), height: 18)
+        startupCommandField.font = NSFont.systemFont(ofSize: 11)
+        startupCommandField.isEditable = true
+        startupCommandField.isSelectable = true
+        startupCommandField.isBordered = true
+        startupCommandField.placeholderString = Self.startupCommandExample
+        startupCommandField.toolTip = "请输入命令。建议使用绝对路径；若使用相对路径，请先进入 PStateRestore 所在目录。"
+        startupCommandField.delegate = self
+        startupCommandField.autoresizingMask = [.width, .minYMargin]
+        view.addSubview(startupCommandField)
+
+        UserDefaults.standard.set(commandEnabled, forKey: Self.startupCommandEnabledKey)
     }
 
     @objc private func autoLoadCheckboxChanged(_ sender: NSButton) {
-        UserDefaults.standard.set(sender.state == .on, forKey: "pstateAutoLoadEnabled")
+        let enabled = sender.state == .on
+        UserDefaults.standard.set(enabled, forKey: Self.autoLoadEnabledKey)
+
+        if enabled {
+            // The two startup modes are mutually exclusive.
+            startupCommandCheckbox.state = .off
+            UserDefaults.standard.set(false, forKey: Self.startupCommandEnabledKey)
+        }
+    }
+
+    @objc private func startupCommandCheckboxChanged(_ sender: NSButton) {
+        let enabled = sender.state == .on
+        UserDefaults.standard.set(enabled, forKey: Self.startupCommandEnabledKey)
+
+        if enabled {
+            // Choosing a shell command turns off the built-in .pstate loader.
+            autoLoadCheckbox.state = .off
+            UserDefaults.standard.set(false, forKey: Self.autoLoadEnabledKey)
+        }
+    }
+
+    func controlTextDidChange(_ notification: Notification) {
+        guard let field = notification.object as? NSTextField,
+              field === startupCommandField else { return }
+        UserDefaults.standard.set(field.stringValue, forKey: Self.startupCommandTextKey)
+    }
+
+    func controlTextDidEndEditing(_ notification: Notification) {
+        guard let field = notification.object as? NSTextField,
+              field === startupCommandField else { return }
+        UserDefaults.standard.set(field.stringValue, forKey: Self.startupCommandTextKey)
     }
     
     func value2Dict(v : UInt64) -> [String: UInt32]{

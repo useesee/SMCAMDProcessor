@@ -250,7 +250,7 @@ class PowerToolViewController: NSViewController, NSWindowDelegate {
             return
         }
 
-        let checkbox = NSButton(
+        let checkbox = HoverCursorButton(
             checkboxWithTitle: "",
             target: self,
             action: #selector(pstateMemoryCheckboxChanged(_:))

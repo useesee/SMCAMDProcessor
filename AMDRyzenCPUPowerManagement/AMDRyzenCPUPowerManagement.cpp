@@ -118,6 +118,18 @@ void AMDRyzenCPUPowerManagement::initWorkLoop() {
 
         //Run initialization
         if(!provider->serviceInitialized){
+            if (provider->restorePStateAfterWake && provider->PStateDef_beforeSleepValid) {
+                IOLog("AMDCPUSupport::startWorkLoop restoring P-state definitions after wake\n");
+                provider->writePstate(provider->PStateDef_beforeSleep);
+                provider->restorePStateAfterWake = false;
+                if (provider->PStateDef_perCore[1] == provider->PStateDef_beforeSleep[1]) {
+                    IOLog("AMDCPUSupport::startWorkLoop P1 restore verified\n");
+                } else {
+                    IOLog("AMDCPUSupport::startWorkLoop P1 restore mismatch: saved=%llx current=%llx\n",
+                          (unsigned long long)provider->PStateDef_beforeSleep[1],
+                          (unsigned long long)provider->PStateDef_perCore[1]);
+                }
+            }
             IOLog("AMDCPUSupport::startWorkLoop initialize service");
             
             //Disable interrupts and sync all processor cores.
@@ -417,6 +429,22 @@ IOReturn AMDRyzenCPUPowerManagement::setPowerState(unsigned long powerStateOrdin
         IOLog("AMDCPUSupport::setPowerState preparing for sleep\n");
         wentToSleep = true;
         stopWorkLoop();
+
+        // Snapshot the live P-state table before sleep can restore firmware defaults.
+        mp_rendezvous_no_intrs([](void *obj) {
+            auto provider = static_cast<AMDRyzenCPUPowerManagement*>(obj);
+            uint32_t cpu_num = cpu_number();
+            if (pmRyzen_cpu_is_master(cpu_num))
+                provider->dumpPstate();
+        }, this);
+        memcpy(PStateDef_beforeSleep, PStateDef_perCore, sizeof(PStateDef_beforeSleep));
+        const uint64_t p1 = PStateDef_beforeSleep[1];
+        PStateDef_beforeSleepValid = (p1 & (1ULL << 63)) != 0 &&
+                                     ((p1 >> 8) & 0x3f) != 0 &&
+                                     (p1 & 0xff) != 0;
+        restorePStateAfterWake = PStateDef_beforeSleepValid;
+        if (!PStateDef_beforeSleepValid)
+            IOLog("AMDCPUSupport::setPowerState no valid P1 snapshot; wake restore skipped\n");
     } else if (1 == powerStateOrdinal && wentToSleep) {
         // Waking up
         IOLog("AMDCPUSupport::setPowerState preparing for wakeup\n");

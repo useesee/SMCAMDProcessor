@@ -1,1 +1,3 @@
 .DS_Store
+# macOS kernel SDK（本地依赖，不入库）
+MacKernelSDK/
