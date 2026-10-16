@@ -109,7 +109,7 @@ void pmRyzen_init_PState(){
     
     uint64_t p1 = pmRyzen_rdmsr_safe(pmRyzen_io_service_handle, MSR_PSTATE_0 + 1);
     // Target P1 at 90% of P0. Integer FID quantization can make the resulting ratio slightly lower.
-    uint64_t p1fid = (uint64_t)((p0spd * 0.90F) / 200.0F * (float)((p1 >> 8) & 0x1f));
+    uint64_t p1fid = (uint64_t)((p0spd * 0.875F) / 200.0F * (float)((p1 >> 8) & 0x1f));
     
     wrmsr64(MSR_PSTATE_0 + 1, (p1 & ~0xFFULL) | p1fid | (1ULL << 63));
 }
