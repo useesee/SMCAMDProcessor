@@ -5,27 +5,27 @@
 //  Menu-bar layout modification:
 //  - CPU label is vertical like TEM/PWR.
 //  - Layout and spacing are controlled by StatusbarLayout constants.
-//  - Temperature turns red above 75 C; power turns red above 10 W.
+//  - Temperature turns red above 70 C; power turns red above 10 W.
 //
 
 import Cocoa
 
 /// Tweak these constants to adjust menu-bar positions and spacing.
 private enum StatusbarLayout {
-    static let itemWidth: CGFloat = 95
+    static let itemWidth: CGFloat = 92
 
     static let cpuX: CGFloat = 0
-    static let temperatureX: CGFloat = 33
-    static let powerX: CGFloat = 68
+    static let temperatureX: CGFloat = 32
+    static let powerX: CGFloat = 64
 
     static let labelWidth: CGFloat = 8
-    static let labelOriginY: CGFloat = -4.5
+    static let labelOriginY: CGFloat = -4
     static let frequencyValueOffsetX: CGFloat = 8
-    static let metricValueOffsetX: CGFloat = 8
+    static let metricValueOffsetX: CGFloat = 7
     static let valueOriginY: CGFloat = 2.5
 
-    static let frequencyTopY: CGFloat = 10
-    static let frequencyBottomY: CGFloat = 0
+    static let frequencyTopY: CGFloat = 9
+    static let frequencyBottomY: CGFloat = -1
 
     static let frequencyThreshold: Float = 3.2
     static let temperatureThreshold: Float = 70
@@ -59,7 +59,7 @@ fileprivate class StatusbarView: NSView {
         paragraphStyle.maximumLineHeight = compactLineHeight
 
         compactLabel = [
-            .font: NSFont(name: "Monaco", size: 7.2)!,
+            .font: NSFont(name: "Monaco", size: 7)!,
             .foregroundColor: NSColor.labelColor,
             .paragraphStyle: paragraphStyle
         ]
@@ -70,12 +70,12 @@ fileprivate class StatusbarView: NSView {
         ]
 
         compactValue = [
-            .font: NSFont.systemFont(ofSize: 9, weight: .semibold),
+            .font: NSFont.systemFont(ofSize: 10, weight: .semibold),
             .foregroundColor: NSColor.labelColor
         ]
 
         normalLabel = [
-            .font: NSFont.systemFont(ofSize: 13, weight: .regular),
+            .font: NSFont.systemFont(ofSize: 12, weight: .regular),
             .foregroundColor: NSColor.labelColor
         ]
     }
