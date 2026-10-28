@@ -1,0 +1,588 @@
+//
+//  StatusbarController.swift
+//  AMD Power Gadget
+//
+//  Menu-bar layout modification:
+//  - CPU label is vertical like TEM/PWR.
+//  - Layout and spacing are controlled by StatusbarLayout constants.
+//  - Temperature turns red above 70 C; power turns red above 10 W.
+//
+
+import Cocoa
+import Darwin
+
+/// Tweak these constants to adjust menu-bar positions and spacing.
+private enum StatusbarLayout {
+    static let itemWidth: CGFloat = 174
+
+    static let cpuX: CGFloat = 0
+    static let temperatureX: CGFloat = 32
+    static let powerX: CGFloat = 64
+
+    static let labelWidth: CGFloat = 8
+    static let labelOriginY: CGFloat = -4
+    static let frequencyValueOffsetX: CGFloat = 8
+    static let metricValueOffsetX: CGFloat = 7
+    static let valueOriginY: CGFloat = 2.5
+
+    static let frequencyTopY: CGFloat = 9
+    static let frequencyBottomY: CGFloat = -1
+
+    static let frequencyThreshold: Float = 3.2
+    static let temperatureThreshold: Float = 70
+    static let powerThreshold: Float = 10
+
+    // The memory pie replaces a text label; the two numbers to its right are
+    // available memory (top) and App + wired + compressed memory (bottom).
+    static let memoryPieX: CGFloat = 96
+    static let memoryPieSize: CGFloat = 16
+    static let memoryValueX: CGFloat = 115
+    static let memoryTopY: CGFloat = 9
+    static let memoryBottomY: CGFloat = -1
+
+    // Virtual fan speed is proportional to average CPU frequency, in rotations/s.
+    static let fanX: CGFloat = 151
+    static let fanSize: CGFloat = 18
+    static let fanLowGHz: Double = 1.2
+    static let fanHighGHz: Double = 4.2
+    static let fanRedThresholdGHz: Double = 3.2
+
+    // Stable, distinct colors for the four memory categories.
+    static let appMemoryColor = NSColor(calibratedRed: 0.20, green: 0.50, blue: 0.88, alpha: 1)
+    static let wiredMemoryColor = NSColor(calibratedRed: 0.96, green: 0.58, blue: 0.16, alpha: 1)
+    static let compressedMemoryColor = NSColor(calibratedRed: 0.62, green: 0.38, blue: 0.82, alpha: 1)
+    static let availableMemoryColor = NSColor(calibratedRed: 0.20, green: 0.68, blue: 0.40, alpha: 1)
+
+    static let highlightColor = NSColor(
+        calibratedRed: 1,
+        green: 0.6,
+        blue: 0,
+        alpha: 1
+    )
+}
+
+// MenuBarMemoryFanPatch: process-free system memory sampling via Mach VM statistics.
+fileprivate struct MenuBarMemorySnapshot {
+    let totalBytes: UInt64
+    let appBytes: UInt64
+    let wiredBytes: UInt64
+    let compressedBytes: UInt64
+    let availableBytes: UInt64
+
+    var usedBytes: UInt64 {
+        min(totalBytes, appBytes + wiredBytes + compressedBytes)
+    }
+
+    private static func pageBytes(_ pages: UInt64, pageSize: UInt64) -> UInt64 {
+        // A physical-memory counter cannot meaningfully exceed the installed RAM.
+        let (value, overflow) = pages.multipliedReportingOverflow(by: pageSize)
+        return overflow ? UInt64.max : value
+    }
+
+    static func compactGiB(_ bytes: UInt64) -> String {
+        String(format: "%.1fG", Double(bytes) / 1_073_741_824.0)
+    }
+
+    private static func tooltipGiB(_ bytes: UInt64) -> String {
+        String(format: "%.2f GiB", Double(bytes) / 1_073_741_824.0)
+    }
+
+    var tooltip: String {
+        [
+            "App 内存（蓝色，估算）：\(Self.tooltipGiB(appBytes))",
+            "联动/有线内存（橙色，Wired）：\(Self.tooltipGiB(wiredBytes))",
+            "被压缩内存（紫色，Compressed）：\(Self.tooltipGiB(compressedBytes))",
+            "可用内存（绿色）：\(Self.tooltipGiB(availableBytes))",
+            "使用内存（以上前三项之和）：\(Self.tooltipGiB(usedBytes))",
+            "物理内存：\(Self.tooltipGiB(totalBytes))",
+            "说明：App 内存按 VM 页计数估算，分类可能与活动监视器略有差异。"
+        ].joined(separator: "\n")
+    }
+
+    static func read() -> MenuBarMemorySnapshot? {
+        var statistics = vm_statistics64()
+        var count = mach_msg_type_number_t(
+            MemoryLayout<vm_statistics64_data_t>.size / MemoryLayout<integer_t>.size
+        )
+        let host = mach_host_self()
+        let result = withUnsafeMutablePointer(to: &statistics) { pointer in
+            pointer.withMemoryRebound(to: integer_t.self, capacity: Int(count)) {
+                host_statistics64(host, HOST_VM_INFO64, $0, &count)
+            }
+        }
+        guard result == KERN_SUCCESS else { return nil }
+
+        var pageSize: vm_size_t = 0
+        guard host_page_size(host, &pageSize) == KERN_SUCCESS, pageSize > 0 else {
+            return nil
+        }
+
+        let total = ProcessInfo.processInfo.physicalMemory
+        let pageSize64 = UInt64(pageSize)
+        let activePages = UInt64(statistics.active_count)
+        let inactivePages = UInt64(statistics.inactive_count)
+        let purgeablePages = UInt64(statistics.purgeable_count)
+        let speculativePages = UInt64(statistics.speculative_count)
+
+        // This estimate excludes purgeable inactive pages, which are reclaimable.
+        let appPages = activePages
+            + (inactivePages > purgeablePages ? inactivePages - purgeablePages : 0)
+            + speculativePages
+        let wiredRaw = pageBytes(UInt64(statistics.wire_count), pageSize: pageSize64)
+        let compressedRaw = pageBytes(UInt64(statistics.compressor_page_count), pageSize: pageSize64)
+
+        // Clamp each category so rounding/reserved pages cannot make the pie exceed RAM.
+        let wired = min(total, wiredRaw)
+        let compressed = min(total - wired, compressedRaw)
+        let appCapacity = total - wired - compressed
+        let app = min(pageBytes(appPages, pageSize: pageSize64), appCapacity)
+        let used = app + wired + compressed
+
+        return MenuBarMemorySnapshot(
+            totalBytes: total,
+            appBytes: app,
+            wiredBytes: wired,
+            compressedBytes: compressed,
+            availableBytes: total - used
+        )
+    }
+}
+
+fileprivate class StatusbarView: NSView {
+
+    var meanFreq: Float = 0
+    var maxFreq: Float = 0
+    var temp: Float = 0
+    var pwr: Float = 0
+    var memorySnapshot: MenuBarMemorySnapshot?
+    var fanAngle: CGFloat = 0
+    var fanSpeedGHz: Double = 1.2
+
+    var normalLabel: [NSAttributedString.Key: NSObject]?
+    var compactLabel: [NSAttributedString.Key: NSObject]?
+    var normalValue: [NSAttributedString.Key: NSObject]?
+    var compactValue: [NSAttributedString.Key: NSObject]?
+
+    func setup() {
+        let compactLineHeight: CGFloat = 6
+
+        let paragraphStyle = NSMutableParagraphStyle()
+        paragraphStyle.minimumLineHeight = compactLineHeight
+        paragraphStyle.maximumLineHeight = compactLineHeight
+
+        compactLabel = [
+            .font: NSFont(name: "Monaco", size: 7)!,
+            .foregroundColor: NSColor.labelColor,
+            .paragraphStyle: paragraphStyle
+        ]
+
+        normalValue = [
+            .font: NSFont.systemFont(ofSize: 14, weight: .regular),
+            .foregroundColor: NSColor.labelColor
+        ]
+
+        compactValue = [
+            .font: NSFont.systemFont(ofSize: 10, weight: .semibold),
+            .foregroundColor: NSColor.labelColor
+        ]
+
+        normalLabel = [
+            .font: NSFont.systemFont(ofSize: 12, weight: .regular),
+            .foregroundColor: NSColor.labelColor
+        ]
+    }
+
+    override func draw(_ dirtyRect: NSRect) {
+        guard NSGraphicsContext.current?.cgContext != nil else { return }
+
+        let averageFrequencyGHz = meanFreq * 0.001
+        let maximumFrequencyGHz = maxFreq * 0.001
+        let averageFrequency = String(format: "%.1f", averageFrequencyGHz)
+        let maximumFrequency = String(format: "%.1f", maximumFrequencyGHz)
+
+        // CPU is drawn vertically like TEM/PWR. Each frequency value turns pink
+        // independently when its own value is greater than 3.2 GHz.
+        drawDoubleCompactValue(
+            label: "CPU",
+            up: "\(maximumFrequency)ᴳ",
+            down: "\(averageFrequency)ᴳ",
+            x: StatusbarLayout.cpuX,
+            upColor: maximumFrequencyGHz > StatusbarLayout.frequencyThreshold ? StatusbarLayout.highlightColor : .labelColor,
+            downColor: averageFrequencyGHz > StatusbarLayout.frequencyThreshold ? StatusbarLayout.highlightColor : .labelColor
+        )
+
+        // Only the metric that crosses its own threshold turns red.
+        drawCompactSingle(
+            label: "TMP",
+            value: "\(Int(round(temp)))º",
+            x: StatusbarLayout.temperatureX,
+            valueColor: temp > StatusbarLayout.temperatureThreshold ? StatusbarLayout.highlightColor : .labelColor
+        )
+
+        drawCompactSingle(
+            label: "PWR",
+            value: "\(Int(round(pwr)))ᵂ",
+            x: StatusbarLayout.powerX,
+            valueColor: pwr > StatusbarLayout.powerThreshold ? StatusbarLayout.highlightColor : .labelColor
+        )
+
+        drawMemoryMonitor()
+        drawFan()
+    }
+
+    /// Draw a compact vertical label in exactly the same narrow text area used by TEM/PWR.
+    private func drawVerticalLabel(_ label: String, x: CGFloat) {
+        let attributedLabel = NSAttributedString(string: label, attributes: compactLabel)
+        attributedLabel.draw(
+            in: NSRect(
+                x: x,
+                y: StatusbarLayout.labelOriginY,
+                width: StatusbarLayout.labelWidth,
+                height: frame.height
+            )
+        )
+    }
+
+    /// Draw a vertical label followed by two stacked frequency values.
+    func drawDoubleCompactValue(
+        label: String,
+        up: String,
+        down: String,
+        x: CGFloat,
+        upColor: NSColor = .labelColor,
+        downColor: NSColor = .labelColor
+    ) {
+        drawVerticalLabel(label, x: x)
+
+        var upperAttributes = compactValue ?? [:]
+        upperAttributes[.foregroundColor] = upColor
+        let upperValue = NSAttributedString(string: up, attributes: upperAttributes)
+        upperValue.draw(
+            at: NSPoint(
+                x: x + StatusbarLayout.frequencyValueOffsetX,
+                y: StatusbarLayout.frequencyTopY
+            )
+        )
+
+        var lowerAttributes = compactValue ?? [:]
+        lowerAttributes[.foregroundColor] = downColor
+        let lowerValue = NSAttributedString(string: down, attributes: lowerAttributes)
+        lowerValue.draw(
+            at: NSPoint(
+                x: x + StatusbarLayout.frequencyValueOffsetX,
+                y: StatusbarLayout.frequencyBottomY
+            )
+        )
+    }
+
+    /// Draw a vertical label and a value whose color can change with the live metric.
+    func drawCompactSingle(
+        label: String,
+        value: String,
+        x: CGFloat,
+        valueColor: NSColor = .labelColor
+    ) {
+        drawVerticalLabel(label, x: x)
+
+        var valueAttributes = normalValue ?? [:]
+        valueAttributes[.foregroundColor] = valueColor
+
+        let attributedValue = NSAttributedString(string: value, attributes: valueAttributes)
+        attributedValue.draw(
+            at: NSPoint(
+                x: x + StatusbarLayout.metricValueOffsetX,
+                y: StatusbarLayout.valueOriginY
+            )
+        )
+    }
+
+    private func drawMemoryMonitor() {
+        drawMemoryPieChart()
+
+        guard let memory = memorySnapshot else {
+            drawMemoryValue("--", y: StatusbarLayout.memoryTopY, color: StatusbarLayout.availableMemoryColor)
+            drawMemoryValue("--", y: StatusbarLayout.memoryBottomY, color: .labelColor)
+            return
+        }
+
+        // Upper row = available RAM; lower row = App + wired + compressed RAM.
+        drawMemoryValue(
+            MenuBarMemorySnapshot.compactGiB(memory.availableBytes),
+            y: StatusbarLayout.memoryTopY,
+            color: StatusbarLayout.availableMemoryColor
+        )
+        drawMemoryValue(
+            MenuBarMemorySnapshot.compactGiB(memory.usedBytes),
+            y: StatusbarLayout.memoryBottomY,
+            color: .labelColor
+        )
+    }
+
+    private func drawMemoryValue(_ value: String, y: CGFloat, color: NSColor) {
+        var attributes = compactValue ?? [:]
+        attributes[.foregroundColor] = color
+        NSAttributedString(string: value, attributes: attributes).draw(
+            at: NSPoint(x: StatusbarLayout.memoryValueX, y: y)
+        )
+    }
+
+    private func drawMemoryPieChart() {
+        guard let context = NSGraphicsContext.current?.cgContext else { return }
+        let size = StatusbarLayout.memoryPieSize
+        let rect = CGRect(
+            x: StatusbarLayout.memoryPieX,
+            y: max(1, (frame.height - size) / 2),
+            width: size,
+            height: size
+        )
+        let center = CGPoint(x: rect.midX, y: rect.midY)
+        let radius = size / 2 - 0.5
+
+        guard let memory = memorySnapshot, memory.totalBytes > 0 else {
+            context.setFillColor(NSColor.secondaryLabelColor.cgColor)
+            context.fillEllipse(in: rect.insetBy(dx: 2, dy: 2))
+            return
+        }
+
+        let segments: [(UInt64, NSColor)] = [
+            (memory.appBytes, StatusbarLayout.appMemoryColor),
+            (memory.wiredBytes, StatusbarLayout.wiredMemoryColor),
+            (memory.compressedBytes, StatusbarLayout.compressedMemoryColor),
+            (memory.availableBytes, StatusbarLayout.availableMemoryColor)
+        ]
+
+        var startAngle: CGFloat = -.pi / 2
+        let fullCircle = 2 * CGFloat.pi
+        for (bytes, color) in segments {
+            let sweep = CGFloat(Double(bytes) / Double(memory.totalBytes)) * fullCircle
+            guard sweep > 0 else { continue }
+            context.beginPath()
+            context.move(to: center)
+            context.addArc(
+                center: center,
+                radius: radius,
+                startAngle: startAngle,
+                endAngle: startAngle + sweep,
+                clockwise: false
+            )
+            context.closePath()
+            context.setFillColor(color.cgColor)
+            context.fillPath()
+            startAngle += sweep
+        }
+
+        context.setStrokeColor(NSColor.windowBackgroundColor.cgColor)
+        context.setLineWidth(0.7)
+        context.strokeEllipse(in: rect.insetBy(dx: 0.35, dy: 0.35))
+    }
+
+    private func drawFan() {
+        guard let context = NSGraphicsContext.current?.cgContext else { return }
+        let frequencyGHz = fanSpeedGHz
+        let fanColor: NSColor = frequencyGHz > StatusbarLayout.fanRedThresholdGHz
+            ? .systemRed
+            : .labelColor
+        let center = CGPoint(
+            x: StatusbarLayout.fanX + StatusbarLayout.fanSize / 2,
+            y: frame.midY
+        )
+        let radius = StatusbarLayout.fanSize / 2 - 1
+
+        context.saveGState()
+        context.translateBy(x: center.x, y: center.y)
+        context.rotate(by: fanAngle)
+        context.setFillColor(fanColor.cgColor)
+
+        // Six curved blades are redrawn at the current angle; the angle itself is
+        // accumulated from elapsed time, not reset on each one-second sensor sample.
+        for blade in 0..<6 {
+            context.saveGState()
+            context.rotate(by: CGFloat(blade) * CGFloat.pi / 3)
+            context.beginPath()
+            context.move(to: CGPoint(x: -1.15, y: 0.25))
+            context.addQuadCurve(
+                to: CGPoint(x: -0.30, y: radius * 0.82),
+                control: CGPoint(x: -1.9, y: radius * 0.43)
+            )
+            context.addQuadCurve(
+                to: CGPoint(x: 1.15, y: radius * 0.68),
+                control: CGPoint(x: 1.55, y: radius * 0.98)
+            )
+            context.addQuadCurve(
+                to: CGPoint(x: 0.75, y: 1.0),
+                control: CGPoint(x: 1.55, y: radius * 0.28)
+            )
+            context.closePath()
+            context.fillPath()
+            context.restoreGState()
+        }
+
+        context.fillEllipse(in: CGRect(x: -1.5, y: -1.5, width: 3, height: 3))
+        context.restoreGState()
+    }
+}
+
+class StatusbarController {
+
+    var statusItem: NSStatusItem!
+    fileprivate var view: StatusbarView!
+
+    var updateTimer: Timer?
+    var fanAnimationTimer: Timer?
+    private var lastFanAnimationTime: TimeInterval = 0
+    private var smoothedFanGHz: Double = StatusbarLayout.fanLowGHz
+    var menu: NSMenu?
+
+    init() {
+        statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
+        statusItem.isVisible = true
+
+        view = StatusbarView()
+        view.setup()
+
+        statusItem.button?.wantsLayer = true
+        statusItem.button?.addSubview(view)
+
+        statusItem.button?.target = self
+        statusItem.button?.action = #selector(itemClicked)
+        statusItem.button?.sendAction(on: [.leftMouseUp, .rightMouseUp])
+
+        statusItem.length = StatusbarLayout.itemWidth
+        view.frame = statusItem.button!.bounds
+
+        addMenuItems()
+        update()
+
+        updateTimer = Timer.scheduledTimer(withTimeInterval: 1, repeats: true, block: { [weak self] _ in
+            self?.update()
+        })
+
+        lastFanAnimationTime = ProcessInfo.processInfo.systemUptime
+        fanAnimationTimer = Timer(timeInterval: 1.0 / 60.0, repeats: true, block: { [weak self] _ in
+            self?.animateFan()
+        })
+        if let timer = fanAnimationTimer {
+            RunLoop.main.add(timer, forMode: .common)
+        }
+    }
+
+    func dismiss() {
+        updateTimer?.invalidate()
+        fanAnimationTimer?.invalidate()
+        updateTimer = nil
+        fanAnimationTimer = nil
+        NSStatusBar.system.removeStatusItem(statusItem!)
+        statusItem = nil
+    }
+
+    func update() {
+        let numberOfCores = ProcessorModel.shared.getNumOfCore()
+        let outputStr: [Float] = ProcessorModel.shared.getMetric(forced: false)
+
+        let power = outputStr[0]
+        let temperature = outputStr[1]
+        var frequencies: [Float] = []
+
+        for i in 0...(numberOfCores - 1) {
+            frequencies.append(outputStr[Int(i + 3)])
+        }
+
+        let meanFre = Float(frequencies.reduce(0, +) / Float(frequencies.count))
+        let maxFre = Float(frequencies.max()!)
+
+        view?.meanFreq = meanFre
+        view?.maxFreq = maxFre
+        view?.temp = temperature
+        view?.pwr = power
+        view?.memorySnapshot = MenuBarMemorySnapshot.read()
+        if let memory = view?.memorySnapshot {
+            statusItem.button?.toolTip = memory.tooltip
+        } else {
+            statusItem.button?.toolTip = "无法读取 macOS VM 内存统计。"
+        }
+        view.setNeedsDisplay(view.frame)
+    }
+
+    private func animateFan() {
+        let now = ProcessInfo.processInfo.systemUptime
+        // Clamp long run-loop pauses so resuming never produces a visible angle jump.
+        let elapsed = max(0, min(now - lastFanAnimationTime, 0.1))
+        lastFanAnimationTime = now
+
+        guard let view = view else { return }
+        let measuredGHz = Double(view.meanFreq) * 0.001
+        let boundedGHz = min(
+            max(measuredGHz, StatusbarLayout.fanLowGHz),
+            StatusbarLayout.fanHighGHz
+        )
+        // Smooth changes in the once-per-second CPU sample over roughly 250 ms.
+        let blend = 1.0 - exp(-elapsed / 0.25)
+        smoothedFanGHz += (boundedGHz - smoothedFanGHz) * blend
+        view.fanSpeedGHz = smoothedFanGHz
+
+        let nextAngle = Double(view.fanAngle) + elapsed * smoothedFanGHz * 2.0 * Double.pi
+        view.fanAngle = CGFloat(nextAngle.truncatingRemainder(dividingBy: 2.0 * Double.pi))
+        view.setNeedsDisplay(
+            NSRect(
+                x: StatusbarLayout.fanX - 1,
+                y: 0,
+                width: StatusbarLayout.fanSize + 2,
+                height: view.bounds.height
+            )
+        )
+    }
+
+    @objc func itemClicked() {
+        switch NSApp.currentEvent?.type {
+        case .leftMouseUp:
+            NSApp.activate(ignoringOtherApps: true)
+            ViewController.launch(forceFocus: true)
+
+        case .rightMouseUp:
+            guard let m = menu else { return }
+            statusItem.popUpMenu(m)
+
+        default:
+            break
+        }
+    }
+
+    @objc func gadget() {
+        ViewController.launch(forceFocus: true)
+    }
+
+    @objc func tool() {
+        PowerToolViewController.launch(forceFocus: true)
+    }
+
+    @objc func fans() {
+        SystemMonitorViewController.launch(forceFocus: true)
+    }
+
+    @objc func exitApp() {
+        exit(0)
+    }
+
+    private func addMenuItems() {
+        menu = NSMenu()
+        guard let m = menu else { return }
+
+        var item = NSMenuItem(title: "AMD Power Gadget", action: #selector(gadget), keyEquivalent: "")
+        item.target = self
+        m.addItem(item)
+
+        item = NSMenuItem(title: "AMD Power Tool", action: #selector(tool), keyEquivalent: "")
+        item.target = self
+        m.addItem(item)
+
+        item = NSMenuItem(title: "SMC Fans", action: #selector(fans), keyEquivalent: "")
+        item.target = self
+        m.addItem(item)
+
+        m.addItem(NSMenuItem.separator())
+
+        item = NSMenuItem(title: "Exit", action: #selector(exitApp), keyEquivalent: "")
+        item.target = self
+        m.addItem(item)
+    }
+}
