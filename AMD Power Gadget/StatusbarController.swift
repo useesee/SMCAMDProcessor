@@ -629,10 +629,10 @@ private final class CPUTooltipViewController: NSViewController {
     private let rowLabels = ["系统：", "用户：", "闲置：", "GPU：", "负载"]
     private let rowColors = [
         StatusbarLayout.cpuSystemColor,
-        StatusbarLayout.wiredColor,
+        StatusbarLayout.appMemoryColor,
         StatusbarLayout.availableColor,
         StatusbarLayout.memoryPressureDotColor,
-        StatusbarLayout.appMemoryColor
+        StatusbarLayout.wiredColor
     ]
 
     override func loadView() {
@@ -1072,7 +1072,7 @@ fileprivate class StatusbarView: NSView {
         let total = max(0.0001, cpuSnapshot.systemPercent + cpuSnapshot.userPercent + cpuSnapshot.idlePercent)
         let pieces: [(Double, NSColor)] = [
             (cpuSnapshot.systemPercent, StatusbarLayout.cpuSystemColor),
-            (cpuSnapshot.userPercent, StatusbarLayout.wiredColor),
+            (cpuSnapshot.userPercent, StatusbarLayout.appMemoryColor),
             (cpuSnapshot.idlePercent, StatusbarLayout.availableColor)
         ]
 
