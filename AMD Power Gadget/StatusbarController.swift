@@ -18,8 +18,7 @@ import QuartzCore
 private enum StatusbarLayout {
     static let fanX: CGFloat = 0
     static let fanSize: CGFloat = 18
-    static let frequencyValueOffsetX: CGFloat = 2
-    static var cpuValueX: CGFloat { fanX + fanSize + frequencyValueOffsetX }
+    static var frequencyValueX: CGFloat = 20
     static let temperatureX: CGFloat = 45
     static let powerX: CGFloat = 78
     static let labelWidth: CGFloat = 8
@@ -640,7 +639,7 @@ fileprivate class StatusbarView: NSView {
         drawDoubleCompactValue(
             up: "\(maximumFrequency)ᴳ",
             down: "\(averageFrequency)ᴳ",
-            x: StatusbarLayout.cpuValueX,
+            x: StatusbarLayout.frequencyValueX,
             upColor: maximumFrequencyGHz > StatusbarLayout.frequencyThreshold ? StatusbarLayout.highlightColor : .labelColor,
             downColor: averageFrequencyGHz > StatusbarLayout.frequencyThreshold ? StatusbarLayout.highlightColor : .labelColor
         )
