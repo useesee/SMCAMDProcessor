@@ -10,17 +10,21 @@
 
 import Cocoa
 import Darwin.Mach
+import Darwin
+import IOKit
 import QuartzCore
 
 /// Tweak these constants to adjust menu-bar positions and spacing.
 // BEGIN statusbar-fan-memory patch (2026-10-22)
+// BEGIN statusbar-cpu-gpu-tooltip patch (2026-10-29)
 /// All menu-bar geometry and thresholds are centralized here.
 private enum StatusbarLayout {
     static let fanX: CGFloat = 0
     static let fanSize: CGFloat = 18
     static var frequencyValueX: CGFloat = 20
-    static let temperatureX: CGFloat = 45
-    static let powerX: CGFloat = 78
+    // 功率在上、温度在下；两行复用 CPU 频率紧凑字形。
+    static let powerTemperatureX: CGFloat = 36
+    static let powerTemperatureValueWidth: CGFloat = 26
     static let labelWidth: CGFloat = 8
     static let labelOriginY: CGFloat = -4
     static let metricValueOffsetX: CGFloat = 7
@@ -28,24 +32,39 @@ private enum StatusbarLayout {
     static let frequencyTopY: CGFloat = 9
     static let frequencyBottomY: CGFloat = -1
     static let memoryPieSize: CGFloat = 16
+    static let memoryPiePopWidth: CGFloat = 128
+    static let memoryPiePopHigh: CGFloat = 128
+    static let memoryPieLabelSize: CGFloat = 60
+    static let memoryPieValueSize: CGFloat = 60
     static let memoryPressureRingInset: CGFloat = 1.5
     static let memoryPressureRingWidth: CGFloat = 1.5
     static let memoryPressureThreshold: Int = 70
     static let memoryPressureRingColor = NSColor(calibratedRed: 1, green: 1, blue: 1, alpha: 1) // #FFFFFF
     static let memoryPressureTrackColor = NSColor(calibratedRed: 1, green: 1, blue: 1, alpha: 0.5) // #FFFFFF80
     static let memoryPressureDotColor = memoryPressureRingColor
-    static let powerValueWidth: CGFloat = 20
-    static let powerToMemoryPieGap: CGFloat = 8
     static var memoryPieX: CGFloat {
-        powerX + metricValueOffsetX + powerValueWidth + powerToMemoryPieGap
+        powerTemperatureX + powerTemperatureValueWidth + 6
     }
-    static let memoryPieToValueGap: CGFloat = 6
+    static let memoryPieToValueGap: CGFloat = 4
+    static let cpuPieSize: CGFloat = 16
+    static let cpuPiePopWidth: CGFloat = 128
+    static let cpuPiePopHigh: CGFloat = 108
+    static let cpuPieLabelSize: CGFloat = 58
+    static let cpuPieValueSize: CGFloat = 80
+    static let cpuPieRingInset: CGFloat = 1.5
+    static let cpuPieRingWidth: CGFloat = 1.5
+    static let cpuPieToValueGap: CGFloat = 4
     static var memoryValueX: CGFloat {
         memoryPieX + memoryPieSize + memoryPieToValueGap
     }
     static let memoryValueWidth: CGFloat = 28
-    static var itemWidth: CGFloat { memoryValueX + memoryValueWidth + 2 }
+    static var cpuPieX: CGFloat { memoryValueX + memoryValueWidth + 6 }
+    static var cpuValueX: CGFloat { cpuPieX + cpuPieSize + cpuPieToValueGap }
+    static let cpuValueWidth: CGFloat = 30
+    static var itemWidth: CGFloat { cpuValueX + cpuValueWidth + 2 }
     static let frequencyThreshold: Float = 3.2
+    static let cpuUsageThreshold: Double = 50.0
+    static let gpuUsageThreshold: Double = 50.0
     static let temperatureThreshold: Float = 70
     static let fanTemperatureThreshold: Float = 65
     static let fanMinimumTemperature: Double = 45.0
@@ -64,6 +83,8 @@ private enum StatusbarLayout {
     static let appMemoryColor = NSColor(calibratedRed: 1, green: 0.6, blue: 0.00, alpha: 1)
     static let wiredColor = NSColor(calibratedRed: 0.28, green: 0.66, blue: 0.98, alpha: 1)
     static let compressedColor = NSColor(calibratedRed: 0.98, green: 0.3, blue: 0.55, alpha: 1)
+    static let cpuSystemColor = NSColor(calibratedRed: 1, green: 0, blue: 0, alpha: 0.88)
+    static let cacheMemoryColor = NSColor(calibratedWhite: 0.60, alpha: 1)
 }
 
 /// Four curved swept blades. One Core Animation rotation is installed in init;
@@ -310,6 +331,8 @@ private struct MemorySnapshot {
     let appBytes: UInt64
     let wiredBytes: UInt64
     let compressedBytes: UInt64
+    /// File-backed pages (external_page_count), used as a cache-memory estimate.
+    let cachedBytes: UInt64
     /// Estimated pressure derived from memory_pressure's system-wide free percentage.
     /// nil means the command failed or its output could not be parsed.
     let pressurePercent: Int?
@@ -320,9 +343,10 @@ private struct MemorySnapshot {
     var appGB: Double { Double(appBytes) / 1_073_741_824.0 }
     var wiredGB: Double { Double(wiredBytes) / 1_073_741_824.0 }
     var compressedGB: Double { Double(compressedBytes) / 1_073_741_824.0 }
+    var cachedGB: Double { Double(cachedBytes) / 1_073_741_824.0 }
     var usedGB: Double { Double(usedBytes) / 1_073_741_824.0 }
 
-    static let zero = MemorySnapshot(availableBytes: 0, appBytes: 0, wiredBytes: 0, compressedBytes: 0, pressurePercent: nil)
+    static let zero = MemorySnapshot(availableBytes: 0, appBytes: 0, wiredBytes: 0, compressedBytes: 0, cachedBytes: 0, pressurePercent: nil)
 }
 
 /// memory_pressure reports system-wide free percentage, not Activity Monitor's private
@@ -382,6 +406,7 @@ private enum MemorySampler {
         let rawApp = appPages * pageBytes
         let rawWired = UInt64(statistics.wire_count) * pageBytes
         let rawCompressed = UInt64(statistics.compressor_page_count) * pageBytes
+        let rawCached = UInt64(statistics.external_page_count) * pageBytes
 
         // Clamp defensively so category totals cannot exceed physical RAM.
         var remaining = total
@@ -394,7 +419,123 @@ private enum MemorySampler {
             appBytes: app,
             wiredBytes: wired,
             compressedBytes: compressed,
+            cachedBytes: min(rawCached, total),
             pressurePercent: MemoryPressureSampler.samplePercent()
+        )
+    }
+}
+
+
+/// Menu-bar CPU/GPU values sampled from the existing one-second status-bar update.
+/// CPU percentages are calculated from cumulative Mach ticks, not process enumeration.
+private struct CPUSnapshot {
+    let systemPercent: Double
+    let userPercent: Double
+    let idlePercent: Double
+    let gpuPercent: Double?
+    let load1: Double
+    let load5: Double
+    let load15: Double
+
+    static let zero = CPUSnapshot(
+        systemPercent: 0, userPercent: 0, idlePercent: 100,
+        gpuPercent: nil, load1: 0, load5: 0, load15: 0
+    )
+}
+
+private enum GPUSampler {
+    /// IOAccelerator keys differ by GPU/driver. Missing keys mean unavailable, not 0%.
+    static func samplePercent() -> Double? {
+        var iterator: io_iterator_t = 0
+        let matching = IOServiceMatching("IOAccelerator")
+        guard IOServiceGetMatchingServices(kIOMasterPortDefault, matching, &iterator) == KERN_SUCCESS else {
+            return nil
+        }
+        defer { IOObjectRelease(iterator) }
+
+        var maximum: Double?
+        while true {
+            let service = IOIteratorNext(iterator)
+            if service == 0 { break }
+            if let property = IORegistryEntryCreateCFProperty(
+                service, "PerformanceStatistics" as CFString, kCFAllocatorDefault, 0
+            )?.takeRetainedValue(), let statistics = property as? NSDictionary {
+                let keys = ["Device Utilization %", "GPU Activity (%)", "Renderer Utilization %"]
+                for key in keys {
+                    if let number = statistics[key] as? NSNumber {
+                        let value = number.doubleValue
+                        if value.isFinite, value >= 0 {
+                            let bounded = min(100.0, value)
+                            maximum = max(maximum ?? bounded, bounded)
+                            break
+                        }
+                    }
+                }
+            }
+            IOObjectRelease(service)
+        }
+        return maximum
+    }
+}
+
+private enum CPUUsageSampler {
+    private static var previousTicks: [UInt32]?
+
+    static func sample() -> CPUSnapshot {
+        let gpu = GPUSampler.samplePercent()
+        var averages = [Double](repeating: 0, count: 3)
+        let averageCount = averages.withUnsafeMutableBufferPointer { buffer -> Int32 in
+            guard let base = buffer.baseAddress else { return 0 }
+            return getloadavg(base, 3)
+        }
+
+        var info = host_cpu_load_info_data_t()
+        var count = mach_msg_type_number_t(
+            MemoryLayout<host_cpu_load_info_data_t>.size / MemoryLayout<integer_t>.size
+        )
+        let host = mach_host_self()
+        defer { mach_port_deallocate(mach_task_self_, host) }
+        let result = withUnsafeMutablePointer(to: &info) { pointer in
+            pointer.withMemoryRebound(to: integer_t.self, capacity: Int(count)) {
+                host_statistics(host, HOST_CPU_LOAD_INFO, $0, &count)
+            }
+        }
+        guard result == KERN_SUCCESS else {
+            return CPUSnapshot(
+                systemPercent: 0, userPercent: 0, idlePercent: 100, gpuPercent: gpu,
+                load1: averageCount > 0 ? averages[0] : 0,
+                load5: averageCount > 1 ? averages[1] : 0,
+                load15: averageCount > 2 ? averages[2] : 0
+            )
+        }
+
+        // cpu_ticks order is USER, SYSTEM, IDLE, NICE in mach/host_info.h.
+        let current = [info.cpu_ticks.0, info.cpu_ticks.1, info.cpu_ticks.2, info.cpu_ticks.3]
+        let percentages: (Double, Double, Double)
+        if let previous = previousTicks, previous.count == current.count {
+            let deltas = zip(previous, current).map { Double($1 &- $0) }
+            let total = deltas.reduce(0, +)
+            if total > 0 {
+                let user = (deltas[0] + deltas[3]) / total * 100.0
+                let system = deltas[1] / total * 100.0
+                let idle = deltas[2] / total * 100.0
+                percentages = (system, user, idle)
+            } else {
+                percentages = (0, 0, 100)
+            }
+        } else {
+            percentages = (0, 0, 100)
+        }
+        previousTicks = current
+
+        return CPUSnapshot(
+            systemPercent: percentages.0,
+            userPercent: percentages.1,
+            idlePercent: percentages.2,
+            gpuPercent: gpu,
+            load1: averageCount > 0 ? averages[0] : 0,
+            load5: averageCount > 1 ? averages[1] : 0,
+            load15: averageCount > 2 ? averages[2] : 0
         )
     }
 }
@@ -410,54 +551,130 @@ private final class MemoryColorDotView: NSView {
 
 /// Native popover tooltip with fixed 128-point width and four same-color dots.
 private final class MemoryTooltipViewController: NSViewController {
+    private var labelFields: [NSTextField] = []
     private var valueFields: [NSTextField] = []
-    private var pressureField: NSTextField?
-    private let rowLabels = ["可用内存：", "App 内存：", "联动内存：", "压缩内存："]
+    private var pressureValueField: NSTextField?
+    private let rowLabels = ["可用内存：", "App内存：", "联动内存：", "压缩内存：", "缓存内存："]
     private let rowColors = [
         StatusbarLayout.availableColor,
         StatusbarLayout.appMemoryColor,
         StatusbarLayout.wiredColor,
-        StatusbarLayout.compressedColor
+        StatusbarLayout.compressedColor,
+        StatusbarLayout.cacheMemoryColor
     ]
 
     override func loadView() {
-        let content = NSView(frame: NSRect(x: 0, y: 0, width: 128, height: 108))
-        let pressureDot = MemoryColorDotView(frame: NSRect(x: 8, y: 86, width: 7, height: 7))
+        let content = NSView(frame: NSRect(x: 0, y: 0, width: StatusbarLayout.memoryPiePopWidth, height: StatusbarLayout.memoryPiePopHigh))
+        let pressureDot = MemoryColorDotView(frame: NSRect(x: 8, y: 110, width: 8, height: 8))
         pressureDot.color = StatusbarLayout.memoryPressureDotColor
         content.addSubview(pressureDot)
-        let pressure = NSTextField(labelWithString: "内存压力：--%")
-        pressure.frame = NSRect(x: 20, y: 81, width: 100, height: 16)
-        pressure.font = NSFont.systemFont(ofSize: 12, weight: .regular)
-        pressure.textColor = NSColor.labelColor
-        content.addSubview(pressure)
-        pressureField = pressure
-        for index in 0..<4 {
-            let rowY = CGFloat(65 - index * 19)
-            let dot = MemoryColorDotView(frame: NSRect(x: 8, y: rowY + 1, width: 7, height: 7))
+
+        let pressureLabel = NSTextField(labelWithString: "内存压力：")
+        pressureLabel.frame = NSRect(x: 18, y: 108, width: StatusbarLayout.memoryPieLabelSize, height: 16)
+        pressureLabel.font = NSFont.systemFont(ofSize: 12, weight: .regular)
+        pressureLabel.textColor = NSColor.labelColor
+        pressureLabel.alignment = .left
+        content.addSubview(pressureLabel)
+
+        let pressureValue = NSTextField(labelWithString: "--%")
+        pressureValue.frame = NSRect(x: 58, y: 108, width: StatusbarLayout.memoryPieValueSize, height: 16)
+        pressureValue.font = NSFont.systemFont(ofSize: 12, weight: .regular)
+        pressureValue.textColor = NSColor.labelColor
+        pressureValue.alignment = .right
+        content.addSubview(pressureValue)
+        pressureValueField = pressureValue
+
+        for index in 0..<rowLabels.count {
+            let rowY = CGFloat(88 - index * 20)
+            let dot = MemoryColorDotView(frame: NSRect(x: 8, y: rowY + 3, width: 8, height: 8))
             dot.color = rowColors[index]
             content.addSubview(dot)
 
-            let field = NSTextField(labelWithString: "")
-            field.frame = NSRect(x: 20, y: rowY - 3, width: 101, height: 16)
-            field.font = NSFont.systemFont(ofSize: 12, weight: .regular)
-            field.textColor = NSColor.labelColor
-            field.lineBreakMode = .byTruncatingTail
-            content.addSubview(field)
-            valueFields.append(field)
+            let label = NSTextField(labelWithString: rowLabels[index])
+            label.frame = NSRect(x: 18, y: rowY, width: StatusbarLayout.memoryPieLabelSize, height: 16)
+            label.font = NSFont.systemFont(ofSize: 12, weight: .regular)
+            label.textColor = NSColor.labelColor
+            label.alignment = .left
+            label.lineBreakMode = .byTruncatingTail
+            content.addSubview(label)
+            labelFields.append(label)
+
+            let value = NSTextField(labelWithString: "--.-G")
+            value.frame = NSRect(x: 58, y: rowY, width: StatusbarLayout.memoryPieValueSize, height: 16)
+            value.font = NSFont.systemFont(ofSize: 12, weight: .regular)
+            value.textColor = NSColor.labelColor
+            value.alignment = .right
+            value.lineBreakMode = .byTruncatingTail
+            content.addSubview(value)
+            valueFields.append(value)
         }
         view = content
     }
 
     func update(snapshot: MemorySnapshot) {
-        // Accessing view triggers lazy loading and is compatible with macOS 10.13.
         _ = self.view
-        let pressureText = snapshot.pressurePercent.map { "内存压力：\($0)%" } ?? "内存压力：--%"
-        if pressureField?.stringValue != pressureText { pressureField?.stringValue = pressureText }
-        let values = [snapshot.availableGB, snapshot.appGB, snapshot.wiredGB, snapshot.compressedGB]
+        let pressure = snapshot.pressurePercent.map { "\($0)%" } ?? "--%"
+        if pressureValueField?.stringValue != pressure { pressureValueField?.stringValue = pressure }
+        let values = [snapshot.availableGB, snapshot.appGB, snapshot.wiredGB,
+                      snapshot.compressedGB, snapshot.cachedGB]
         for index in 0..<min(valueFields.count, values.count) {
-            let newText = rowLabels[index] + String(format: "%.1fG", values[index])
-            if valueFields[index].stringValue != newText {
-                valueFields[index].stringValue = newText
+            let text = String(format: "%.1fG", values[index])
+            if valueFields[index].stringValue != text { valueFields[index].stringValue = text }
+        }
+    }
+}
+
+private final class CPUTooltipViewController: NSViewController {
+    private var valueFields: [NSTextField] = []
+    private let rowLabels = ["系统：", "用户：", "闲置：", "GPU：", "负载"]
+    private let rowColors = [
+        StatusbarLayout.cpuSystemColor,
+        StatusbarLayout.wiredColor,
+        StatusbarLayout.availableColor,
+        StatusbarLayout.memoryPressureDotColor,
+        StatusbarLayout.appMemoryColor
+    ]
+
+    override func loadView() {
+        let content = NSView(frame: NSRect(x: 0, y: 0, width: StatusbarLayout.cpuPiePopWidth, height: StatusbarLayout.cpuPiePopHigh))
+        for index in 0..<rowLabels.count {
+            let rowY = CGFloat(88 - index * 20)
+            let dot = MemoryColorDotView(frame: NSRect(x: 8, y: rowY + 3, width: 8, height: 8))
+            dot.color = rowColors[index]
+            content.addSubview(dot)
+
+            let label = NSTextField(labelWithString: rowLabels[index])
+            label.frame = NSRect(x: 18, y: rowY, width: StatusbarLayout.cpuPieLabelSize, height: 16)
+            label.font = NSFont.systemFont(ofSize: 12, weight: .regular)
+            label.textColor = NSColor.labelColor
+            label.alignment = .left
+            content.addSubview(label)
+
+            let value = NSTextField(labelWithString: "--.-%")
+            value.frame = NSRect(x: 40, y: rowY, width: StatusbarLayout.cpuPieValueSize, height: 16)
+            value.font = NSFont.systemFont(ofSize: 12, weight: .regular)
+            value.textColor = NSColor.labelColor
+            value.alignment = .right
+            value.lineBreakMode = .byTruncatingTail
+            content.addSubview(value)
+            valueFields.append(value)
+        }
+        view = content
+    }
+
+    func update(snapshot: CPUSnapshot) {
+        _ = self.view
+        let gpuText = snapshot.gpuPercent.map { String(format: "%.1f%%", $0) } ?? "--.-%"
+        let values = [
+            String(format: "%.1f%%", snapshot.systemPercent),
+            String(format: "%.1f%%", snapshot.userPercent),
+            String(format: "%.1f%%", snapshot.idlePercent),
+            gpuText,
+            String(format: "%.1f  %.1f  %.1f", snapshot.load1, snapshot.load5, snapshot.load15)
+        ]
+        for index in 0..<min(valueFields.count, values.count) {
+            if valueFields[index].stringValue != values[index] {
+                valueFields[index].stringValue = values[index]
             }
         }
     }
@@ -472,6 +689,7 @@ fileprivate class StatusbarView: NSView {
     var temp: Float = 0
     var pwr: Float = 0
     private var memorySnapshot = MemorySnapshot.zero
+    private var cpuSnapshot = CPUSnapshot.zero
 
     var normalLabel: [NSAttributedString.Key: NSObject]?
     var compactLabel: [NSAttributedString.Key: NSObject]?
@@ -482,7 +700,14 @@ fileprivate class StatusbarView: NSView {
     private var memoryPopover: NSPopover?
     private var memoryTooltipController: MemoryTooltipViewController?
     private var memoryTrackingArea: NSTrackingArea?
-    private var hoveringMemoryPie = false
+    private var cpuPopover: NSPopover?
+    private var cpuTooltipController: CPUTooltipViewController?
+    private var cpuTrackingArea: NSTrackingArea?
+    private enum TooltipKind: Equatable { case memory, cpu }
+    private var activeTooltipKind: TooltipKind?
+    private var activeTooltipPopover: NSPopover?
+    private var tooltipPositionTimer: Timer?
+    private var tooltipOutsideSince: TimeInterval?
     private var previousFanTemperature: Float?
 
     func setup() {
@@ -516,14 +741,23 @@ fileprivate class StatusbarView: NSView {
         fanIndicatorView = fan
         addSubview(fan)
 
-        let tooltipController = MemoryTooltipViewController(nibName: nil, bundle: nil)
-        let popover = NSPopover()
-        popover.behavior = .transient
-        popover.contentSize = NSSize(width: 128, height: 108)
-        popover.contentViewController = tooltipController
-        memoryTooltipController = tooltipController
-        memoryPopover = popover
-        tooltipController.update(snapshot: memorySnapshot)
+        let memoryController = MemoryTooltipViewController(nibName: nil, bundle: nil)
+        let memoryPopover = NSPopover()
+        memoryPopover.behavior = .transient
+        memoryPopover.contentSize = NSSize(width: StatusbarLayout.memoryPiePopWidth, height: StatusbarLayout.memoryPiePopHigh)
+        memoryPopover.contentViewController = memoryController
+        self.memoryTooltipController = memoryController
+        self.memoryPopover = memoryPopover
+        memoryController.update(snapshot: memorySnapshot)
+
+        let cpuController = CPUTooltipViewController(nibName: nil, bundle: nil)
+        let cpuPopover = NSPopover()
+        cpuPopover.behavior = .transient
+        cpuPopover.contentSize = NSSize(width: StatusbarLayout.cpuPiePopWidth, height: StatusbarLayout.cpuPiePopHigh)
+        cpuPopover.contentViewController = cpuController
+        self.cpuTooltipController = cpuController
+        self.cpuPopover = cpuPopover
+        cpuController.update(snapshot: cpuSnapshot)
     }
 
     override func layout() {
@@ -536,11 +770,13 @@ fileprivate class StatusbarView: NSView {
         )
         fanIndicatorView?.needsLayout = true
         refreshMemoryTrackingArea()
+        refreshCPUTrackingArea()
     }
 
     override func viewDidMoveToWindow() {
         super.viewDidMoveToWindow()
         refreshMemoryTrackingArea()
+        refreshCPUTrackingArea()
     }
 
     private var memoryPieRect: NSRect {
@@ -552,6 +788,15 @@ fileprivate class StatusbarView: NSView {
         )
     }
 
+    private var cpuPieRect: NSRect {
+        NSRect(
+            x: StatusbarLayout.cpuPieX,
+            y: max(0, (bounds.height - StatusbarLayout.cpuPieSize) / 2.0),
+            width: StatusbarLayout.cpuPieSize,
+            height: StatusbarLayout.cpuPieSize
+        )
+    }
+
     private func refreshMemoryTrackingArea() {
         if let oldArea = memoryTrackingArea {
             removeTrackingArea(oldArea)
@@ -559,7 +804,7 @@ fileprivate class StatusbarView: NSView {
         }
         guard bounds.height >= StatusbarLayout.memoryPieSize else { return }
         let area = NSTrackingArea(
-            rect: memoryPieRect,
+            rect: memoryPieRect.insetBy(dx: -2, dy: -2),
             options: [.mouseEnteredAndExited, .activeAlways],
             owner: self,
             userInfo: nil
@@ -568,41 +813,121 @@ fileprivate class StatusbarView: NSView {
         addTrackingArea(area)
     }
 
+    private func refreshCPUTrackingArea() {
+        if let oldArea = cpuTrackingArea {
+            removeTrackingArea(oldArea)
+            cpuTrackingArea = nil
+        }
+        guard bounds.height >= StatusbarLayout.cpuPieSize else { return }
+        let area = NSTrackingArea(
+            rect: cpuPieRect.insetBy(dx: -2, dy: -2),
+            options: [.mouseEnteredAndExited, .activeAlways],
+            owner: self,
+            userInfo: nil
+        )
+        cpuTrackingArea = area
+        addTrackingArea(area)
+    }
+
     override func mouseEntered(with event: NSEvent) {
-        guard let area = memoryTrackingArea, event.trackingArea === area else {
-            super.mouseEntered(with: event)
+        if let area = memoryTrackingArea, event.trackingArea === area {
+            memoryTooltipController?.update(snapshot: memorySnapshot)
+            showTooltip(kind: .memory)
             return
         }
-        hoveringMemoryPie = true
-        memoryTooltipController?.update(snapshot: memorySnapshot)
-        if let popover = memoryPopover, !popover.isShown {
-            popover.show(relativeTo: memoryPieRect, of: self, preferredEdge: .minY)
+        if let area = cpuTrackingArea, event.trackingArea === area {
+            cpuTooltipController?.update(snapshot: cpuSnapshot)
+            showTooltip(kind: .cpu)
+            return
         }
+        super.mouseEntered(with: event)
     }
 
     override func mouseExited(with event: NSEvent) {
-        guard let area = memoryTrackingArea, event.trackingArea === area else {
-            super.mouseExited(with: event)
+        // Hover state is determined by screen position, so moving from the icon into
+        // its popover does not close it prematurely.
+        super.mouseExited(with: event)
+    }
+
+    private func showTooltip(kind: TooltipKind) {
+        let targetPopover: NSPopover
+        let anchorRect: NSRect
+        switch kind {
+        case .memory:
+            guard let popover = memoryPopover else { return }
+            targetPopover = popover
+            anchorRect = memoryPieRect
+        case .cpu:
+            guard let popover = cpuPopover else { return }
+            targetPopover = popover
+            anchorRect = cpuPieRect
+        }
+
+        if let current = activeTooltipPopover, current !== targetPopover, current.isShown {
+            current.performClose(nil)
+        }
+        activeTooltipKind = kind
+        activeTooltipPopover = targetPopover
+        tooltipOutsideSince = nil
+        if !targetPopover.isShown {
+            targetPopover.show(relativeTo: anchorRect, of: self, preferredEdge: .minY)
+        }
+        startTooltipPositionMonitorIfNeeded()
+    }
+
+    private func startTooltipPositionMonitorIfNeeded() {
+        guard activeTooltipPopover?.isShown == true else { return }
+        tooltipPositionTimer?.invalidate()
+        tooltipOutsideSince = nil
+        let timer = Timer(timeInterval: 0.20, repeats: true) { [weak self] _ in
+            self?.checkTooltipPosition()
+        }
+        tooltipPositionTimer = timer
+        RunLoop.main.add(timer, forMode: .common)
+    }
+
+    private func checkTooltipPosition() {
+        guard let popover = activeTooltipPopover, popover.isShown else {
+            stopTooltipPositionMonitor()
             return
         }
-        hoveringMemoryPie = false
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.65) { [weak self] in
-            guard let self = self, !self.hoveringMemoryPie else { return }
-            if let popover = self.memoryPopover, popover.isShown {
-                popover.performClose(nil)
-            }
+        guard let window = self.window, let kind = activeTooltipKind else { return }
+        let anchorRect = (kind == .memory) ? memoryPieRect : cpuPieRect
+        let anchorInWindow = convert(anchorRect, to: nil)
+        let anchorOnScreen = window.convertToScreen(anchorInWindow).insetBy(dx: -4, dy: -4)
+        let mouse = NSEvent.mouseLocation
+        let popoverOnScreen = popover.contentViewController?.view.window?.frame
+            .insetBy(dx: -4, dy: -4)
+        if anchorOnScreen.contains(mouse) || (popoverOnScreen?.contains(mouse) ?? false) {
+            tooltipOutsideSince = nil
+            return
         }
+
+        let now = ProcessInfo.processInfo.systemUptime
+        if tooltipOutsideSince == nil {
+            tooltipOutsideSince = now
+        } else if let outsideSince = tooltipOutsideSince, now - outsideSince >= 0.65 {
+            popover.performClose(nil)
+            stopTooltipPositionMonitor()
+        }
+    }
+
+    private func stopTooltipPositionMonitor() {
+        tooltipPositionTimer?.invalidate()
+        tooltipPositionTimer = nil
+        tooltipOutsideSince = nil
+        activeTooltipPopover = nil
+        activeTooltipKind = nil
     }
 
     func closeMemoryTooltip() {
-        hoveringMemoryPie = false
-        if let popover = memoryPopover, popover.isShown {
-            popover.performClose(nil)
-        }
+        if let popover = memoryPopover, popover.isShown { popover.performClose(nil) }
+        if let popover = cpuPopover, popover.isShown { popover.performClose(nil) }
+        stopTooltipPositionMonitor()
     }
 
     func updateMetrics(meanFreq: Float, maxFreq: Float, temperature: Float, power: Float,
-                       memory: MemorySnapshot?) {
+                       memory: MemorySnapshot?, cpu: CPUSnapshot) {
         self.meanFreq = meanFreq
         self.maxFreq = maxFreq
         self.temp = temperature
@@ -611,6 +936,8 @@ fileprivate class StatusbarView: NSView {
             memorySnapshot = memory
             memoryTooltipController?.update(snapshot: memory)
         }
+        cpuSnapshot = cpu
+        cpuTooltipController?.update(snapshot: cpu)
 
         if let previous = previousFanTemperature {
             if previous != temperature {
@@ -634,8 +961,6 @@ fileprivate class StatusbarView: NSView {
         let averageFrequency = String(format: "%.1f", averageFrequencyGHz)
         let maximumFrequency = String(format: "%.1f", maximumFrequencyGHz)
 
-        // The fan replaces the former CPU text label. CPU values start six points
-        // after the 16-point fan, and keep the original top/bottom arrangement.
         drawDoubleCompactValue(
             up: "\(maximumFrequency)ᴳ",
             down: "\(averageFrequency)ᴳ",
@@ -644,24 +969,20 @@ fileprivate class StatusbarView: NSView {
             downColor: averageFrequencyGHz > StatusbarLayout.frequencyThreshold ? StatusbarLayout.highlightColor : .labelColor
         )
 
-        drawCompactSingle(
-            label: "TMP",
-            value: "\(Int(round(temp)))º",
-            x: StatusbarLayout.temperatureX,
-            valueColor: temp > StatusbarLayout.temperatureThreshold ? StatusbarLayout.highlightColor : .labelColor
-        )
-
-        drawCompactSingle(
-            label: "PWR",
-            value: "\(Int(round(pwr)))ᵂ",
-            x: StatusbarLayout.powerX,
-            valueColor: pwr > StatusbarLayout.powerThreshold ? StatusbarLayout.highlightColor : .labelColor,
+        drawDoubleCompactValue(
+            up: "\(Int(round(pwr)))ᵂ",
+            down: "\(Int(round(temp)))º",
+            x: StatusbarLayout.powerTemperatureX,
+            upColor: pwr > StatusbarLayout.powerThreshold ? StatusbarLayout.highlightColor : .labelColor,
+            downColor: temp > StatusbarLayout.temperatureThreshold ? StatusbarLayout.highlightColor : .labelColor,
             rightAligned: true,
-            valueWidth: StatusbarLayout.powerValueWidth
+            valueWidth: StatusbarLayout.powerTemperatureValueWidth
         )
 
         drawMemoryPie()
         drawMemoryValues()
+        drawCPUPie()
+        drawCPUValues()
     }
 
     private func drawMemoryPie() {
@@ -744,6 +1065,96 @@ fileprivate class StatusbarView: NSView {
                               width: StatusbarLayout.memoryValueWidth, attributes: attributes)
     }
 
+    private func drawCPUPie() {
+        let rect = cpuPieRect
+        let center = NSPoint(x: rect.midX, y: rect.midY)
+        let radius = min(rect.width, rect.height) / 2.0
+        let total = max(0.0001, cpuSnapshot.systemPercent + cpuSnapshot.userPercent + cpuSnapshot.idlePercent)
+        let pieces: [(Double, NSColor)] = [
+            (cpuSnapshot.systemPercent, StatusbarLayout.cpuSystemColor),
+            (cpuSnapshot.userPercent, StatusbarLayout.wiredColor),
+            (cpuSnapshot.idlePercent, StatusbarLayout.availableColor)
+        ]
+
+        var startAngle: CGFloat = 90.0
+        for (percentage, color) in pieces where percentage > 0 {
+            let sweep = CGFloat(percentage / total * 360.0)
+            let endAngle = startAngle - sweep
+            let startRadians = startAngle * CGFloat.pi / 180.0
+            let path = NSBezierPath()
+            path.move(to: center)
+            path.line(to: NSPoint(
+                x: center.x + cos(startRadians) * radius,
+                y: center.y + sin(startRadians) * radius
+            ))
+            path.appendArc(
+                withCenter: center,
+                radius: radius,
+                startAngle: startAngle,
+                endAngle: endAngle,
+                clockwise: true
+            )
+            path.close()
+            color.setFill()
+            path.fill()
+            startAngle = endAngle
+        }
+
+        let ringRect = rect.insetBy(dx: -StatusbarLayout.cpuPieRingInset,
+                                    dy: -StatusbarLayout.cpuPieRingInset)
+        let track = NSBezierPath(ovalIn: ringRect)
+        track.lineWidth = StatusbarLayout.cpuPieRingWidth
+        StatusbarLayout.memoryPressureTrackColor.setStroke()
+        track.stroke()
+
+        if let gpu = cpuSnapshot.gpuPercent, gpu > 0 {
+            let arc = NSBezierPath()
+            arc.lineWidth = StatusbarLayout.cpuPieRingWidth
+            arc.lineCapStyle = .round
+            let endAngle = CGFloat(90.0 - 360.0 * min(100.0, max(0.0, gpu)) / 100.0)
+            arc.appendArc(
+                withCenter: center,
+                radius: radius + StatusbarLayout.cpuPieRingInset,
+                startAngle: 90,
+                endAngle: endAngle,
+                clockwise: true
+            )
+            let color = gpu > StatusbarLayout.gpuUsageThreshold
+                ? StatusbarLayout.highlightColor
+                : StatusbarLayout.memoryPressureRingColor
+            color.setStroke()
+            arc.stroke()
+        }
+    }
+
+    private func drawCPUValues() {
+        var attributes = compactValue ?? [:]
+        attributes[.foregroundColor] = NSColor.labelColor
+        let systemColor = cpuSnapshot.systemPercent > StatusbarLayout.cpuUsageThreshold
+            ? StatusbarLayout.highlightColor : NSColor.labelColor
+        let userColor = cpuSnapshot.userPercent > StatusbarLayout.cpuUsageThreshold
+            ? StatusbarLayout.highlightColor : NSColor.labelColor
+
+        var systemAttributes = attributes
+        systemAttributes[.foregroundColor] = systemColor
+        drawRightAlignedValue(
+            String(format: "%.1f%%", cpuSnapshot.systemPercent),
+            x: StatusbarLayout.cpuValueX,
+            y: StatusbarLayout.frequencyTopY,
+            width: StatusbarLayout.cpuValueWidth,
+            attributes: systemAttributes
+        )
+        var userAttributes = attributes
+        userAttributes[.foregroundColor] = userColor
+        drawRightAlignedValue(
+            String(format: "%.1f%%", cpuSnapshot.userPercent),
+            x: StatusbarLayout.cpuValueX,
+            y: StatusbarLayout.frequencyBottomY,
+            width: StatusbarLayout.cpuValueWidth,
+            attributes: userAttributes
+        )
+    }
+
     private func drawRightAlignedValue(_ text: String, x: CGFloat, y: CGFloat,
                                        width: CGFloat,
                                        attributes: [NSAttributedString.Key: NSObject]) {
@@ -765,17 +1176,26 @@ fileprivate class StatusbarView: NSView {
 
     private func drawDoubleCompactValue(up: String, down: String, x: CGFloat,
                                         upColor: NSColor = .labelColor,
-                                        downColor: NSColor = .labelColor) {
+                                        downColor: NSColor = .labelColor,
+                                        rightAligned: Bool = false,
+                                        valueWidth: CGFloat = 0) {
         var upperAttributes = compactValue ?? [:]
         upperAttributes[.foregroundColor] = upColor
-        NSAttributedString(string: up, attributes: upperAttributes).draw(
-            at: NSPoint(x: x, y: StatusbarLayout.frequencyTopY)
-        )
         var lowerAttributes = compactValue ?? [:]
         lowerAttributes[.foregroundColor] = downColor
-        NSAttributedString(string: down, attributes: lowerAttributes).draw(
-            at: NSPoint(x: x, y: StatusbarLayout.frequencyBottomY)
-        )
+        if rightAligned {
+            drawRightAlignedValue(up, x: x, y: StatusbarLayout.frequencyTopY,
+                                  width: valueWidth, attributes: upperAttributes)
+            drawRightAlignedValue(down, x: x, y: StatusbarLayout.frequencyBottomY,
+                                  width: valueWidth, attributes: lowerAttributes)
+        } else {
+            NSAttributedString(string: up, attributes: upperAttributes).draw(
+                at: NSPoint(x: x, y: StatusbarLayout.frequencyTopY)
+            )
+            NSAttributedString(string: down, attributes: lowerAttributes).draw(
+                at: NSPoint(x: x, y: StatusbarLayout.frequencyBottomY)
+            )
+        }
     }
 
     private func drawCompactSingle(label: String, value: String, x: CGFloat,
@@ -862,14 +1282,16 @@ class StatusbarController {
         guard !frequencies.isEmpty, let maximum = frequencies.max() else { return }
         let mean = frequencies.reduce(0, +) / Float(frequencies.count)
 
-        // Exactly one memory sample per existing one-second update; no second timer.
+        // Memory, CPU, GPU and load averages reuse this existing one-second update.
         let memory = MemorySampler.sample()
+        let cpu = CPUUsageSampler.sample()
         view?.updateMetrics(
             meanFreq: mean,
             maxFreq: maximum,
             temperature: temperature,
             power: power,
-            memory: memory
+            memory: memory,
+            cpu: cpu
         )
     }
 
